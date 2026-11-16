@@ -34,3 +34,6 @@ bool IsShellExe(const std::wstring& exeName);
 std::wstring AudioTargetProblem(DWORD processId);
 
 std::wstring AudioAppDisplayName(const AudioAppInfo& info);
+
+// Windows build number (e.g. 22631). Per-app audio capture needs build 20348 or newer.
+DWORD WindowsBuildNumber();

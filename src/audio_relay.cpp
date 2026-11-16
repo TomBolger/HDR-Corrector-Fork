@@ -22,6 +22,7 @@ namespace {
 
 constexpr DWORD kAudioRelayStartupTimeoutMs = 8000;
 constexpr DWORD kAudioRelayStopWaitMs = 2000;
+constexpr REFERENCE_TIME kSampleBufferDuration = 200000;  // 20 ms, as in Microsoft's ApplicationLoopback sample
 constexpr wchar_t kAudioRelaySessionName[] = L"HDR Corrector Stream Audio";
 
 class AudioActivationHandler final : public IActivateAudioInterfaceCompletionHandler {
@@ -47,7 +48,8 @@ public:
             return E_POINTER;
         }
 
-        if (iid == __uuidof(IUnknown) || iid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
+        if (iid == __uuidof(IUnknown) || iid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
+            iid == __uuidof(IAgileObject)) {
             *object = static_cast<IActivateAudioInterfaceCompletionHandler*>(this);
             AddRef();
             return S_OK;
@@ -141,7 +143,8 @@ HRESULT CreateDefaultRenderClient(
     ComPtr<IAudioRenderClient>& renderService,
     WAVEFORMATEX** format,
     UINT32& bufferFrames,
-    HANDLE renderEvent) {
+    HANDLE renderEvent,
+    const WAVEFORMATEX* fixedFormat = nullptr) {
 
     ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(
@@ -164,9 +167,17 @@ HRESULT CreateDefaultRenderClient(
         return hr;
     }
 
-    hr = renderClient->GetMixFormat(format);
-    if (FAILED(hr)) {
-        return hr;
+    if (fixedFormat) {
+        *format = static_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+        if (!*format) {
+            return E_OUTOFMEMORY;
+        }
+        **format = *fixedFormat;
+    } else {
+        hr = renderClient->GetMixFormat(format);
+        if (FAILED(hr)) {
+            return hr;
+        }
     }
 
     constexpr DWORD streamFlags =
@@ -207,8 +218,11 @@ HRESULT CreateLoopbackCaptureClient(
     WAVEFORMATEX* format,
     HANDLE captureEvent,
     ComPtr<IAudioClient>& captureClient,
-    ComPtr<IAudioCaptureClient>& captureService) {
+    ComPtr<IAudioCaptureClient>& captureService,
+    REFERENCE_TIME bufferDuration,
+    const wchar_t*& failedStep) {
 
+    failedStep = L"ActivateAudioInterfaceAsync";
     HRESULT hr = ActivateProcessLoopbackClient(targetProcessId, captureClient);
     if (FAILED(hr)) {
         return hr;
@@ -220,17 +234,24 @@ HRESULT CreateLoopbackCaptureClient(
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
         AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-    hr = captureClient->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 0, 0, format, nullptr);
+    failedStep = L"IAudioClient::Initialize";
+    hr = captureClient->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, bufferDuration, 0, format, nullptr);
     if (FAILED(hr)) {
         return hr;
     }
 
+    failedStep = L"IAudioClient::SetEventHandle";
     hr = captureClient->SetEventHandle(captureEvent);
     if (FAILED(hr)) {
         return hr;
     }
 
-    return captureClient->GetService(IID_PPV_ARGS(&captureService));
+    failedStep = L"IAudioClient::GetService";
+    hr = captureClient->GetService(IID_PPV_ARGS(&captureService));
+    if (SUCCEEDED(hr)) {
+        failedStep = L"";
+    }
+    return hr;
 }
 
 bool WaitForStopOrEvent(HANDLE stopEvent, HANDLE eventHandle, DWORD timeoutMilliseconds) {
@@ -414,28 +435,79 @@ void AudioRelay::Worker() {
         return;
     }
 
-    if (SUCCEEDED(startupHr)) {
-        startupHr = CreateDefaultRenderClient(renderClient, renderService, &format, renderBufferFrames, renderEvent);
-    }
-    if (SUCCEEDED(startupHr)) {
-        startupHr = CreateLoopbackCaptureClient(targetProcessId_, format, captureEvent, captureClient, captureService);
-    }
-    if (SUCCEEDED(startupHr)) {
-        BYTE* silence = nullptr;
-        startupHr = renderService->GetBuffer(renderBufferFrames, &silence);
-        if (SUCCEEDED(startupHr)) {
-            startupHr = renderService->ReleaseBuffer(renderBufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+    // Attempt 0 is the original setup. Application capture also retries with the settings
+    // Microsoft's ApplicationLoopback sample uses (20 ms buffer, then 16-bit 44.1 kHz PCM).
+    const wchar_t* failedStep = L"COM initialization";
+    WAVEFORMATEX pcm = {};
+    pcm.wFormatTag = WAVE_FORMAT_PCM;
+    pcm.nChannels = 2;
+    pcm.nSamplesPerSec = 44100;
+    pcm.wBitsPerSample = 16;
+    pcm.nBlockAlign = static_cast<WORD>(pcm.nChannels * pcm.wBitsPerSample / 8);
+    pcm.nAvgBytesPerSec = pcm.nSamplesPerSec * pcm.nBlockAlign;
+
+    const HRESULT comHr = startupHr;
+    const int attempts = targetProcessId_ != 0 ? 3 : 1;
+    for (int attempt = 0; attempt < attempts && SUCCEEDED(comHr); ++attempt) {
+        if (attempt > 0) {
+            Log(L"Audio capture attempt " + std::to_wstring(attempt) + L" failed at " + std::wstring(failedStep) + L": " +
+                HResultMessage(startupHr) + L". Retrying with fallback settings.");
+            if (captureClient) {
+                captureClient->Stop();
+            }
+            if (renderClient) {
+                renderClient->Stop();
+            }
+            captureService.Reset();
+            captureClient.Reset();
+            renderService.Reset();
+            renderClient.Reset();
+            if (format) {
+                CoTaskMemFree(format);
+                format = nullptr;
+            }
         }
-    }
-    if (SUCCEEDED(startupHr)) {
-        startupHr = renderClient->Start();
-    }
-    if (SUCCEEDED(startupHr)) {
-        startupHr = captureClient->Start();
+
+        const REFERENCE_TIME bufferDuration = attempt == 0 ? 0 : kSampleBufferDuration;
+        const WAVEFORMATEX* fixedFormat = attempt == 2 ? &pcm : nullptr;
+
+        failedStep = L"render device setup";
+        startupHr = CreateDefaultRenderClient(renderClient, renderService, &format, renderBufferFrames, renderEvent, fixedFormat);
+        if (SUCCEEDED(startupHr)) {
+            startupHr = CreateLoopbackCaptureClient(
+                targetProcessId_, format, captureEvent, captureClient, captureService, bufferDuration, failedStep);
+        }
+        if (SUCCEEDED(startupHr)) {
+            failedStep = L"render prefill";
+            BYTE* silence = nullptr;
+            startupHr = renderService->GetBuffer(renderBufferFrames, &silence);
+            if (SUCCEEDED(startupHr)) {
+                startupHr = renderService->ReleaseBuffer(renderBufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
+            }
+        }
+        if (SUCCEEDED(startupHr)) {
+            failedStep = L"render Start";
+            startupHr = renderClient->Start();
+        }
+        if (SUCCEEDED(startupHr)) {
+            failedStep = L"capture Start";
+            startupHr = captureClient->Start();
+        }
+        if (SUCCEEDED(startupHr)) {
+            if (attempt > 0) {
+                Log(L"Audio capture started with fallback settings #" + std::to_wstring(attempt) + L".");
+            }
+            break;
+        }
     }
 
     if (FAILED(startupHr)) {
-        finishStartup(startupHr, L"Audio relay setup failed: " + HResultMessage(startupHr));
+        std::wstring message = L"Audio relay setup failed";
+        if (failedStep && *failedStep) {
+            message += L" at " + std::wstring(failedStep);
+        }
+        message += L": " + HResultMessage(startupHr);
+        finishStartup(startupHr, message);
     } else {
         running_ = true;
         finishStartup(S_OK);

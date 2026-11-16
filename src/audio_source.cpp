@@ -317,3 +317,15 @@ DWORD FindProcessByExeName(const std::wstring& exeName) {
 std::wstring AudioTargetProblem(DWORD processId) {
     return CheckTree(processId, ProcessSnapshot());
 }
+
+DWORD WindowsBuildNumber() {
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto rtlGetVersion = ntdll ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
+    if (!rtlGetVersion) {
+        return 0;
+    }
+    OSVERSIONINFOW info = {};
+    info.dwOSVersionInfoSize = sizeof(info);
+    return rtlGetVersion(&info) == 0 ? info.dwBuildNumber : 0;
+}

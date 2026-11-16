@@ -80,6 +80,7 @@ constexpr UINT kCmdAudioSourceDesktop = 208;
 constexpr UINT kCmdAudioSourceActive = 209;
 constexpr UINT kCmdAudioSourceSelect = 210;
 constexpr UINT kCmdAudioSourceStatus = 211;
+constexpr UINT kCmdCopyLog = 212;
 
 constexpr UINT_PTR kAudioWatchTimerId = 1;
 constexpr UINT kAudioWatchIntervalMs = 2000;
@@ -1146,6 +1147,7 @@ private:
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), kCmdStartup, L"Run at startup");
         AppendMenuW(menu, MF_STRING, kCmdOpenFolder, L"Open screenshots folder");
+        AppendMenuW(menu, MF_STRING, kCmdCopyLog, L"Copy log to clipboard (for troubleshooting)");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kCmdExit, L"Exit");
 
@@ -1186,6 +1188,9 @@ private:
         case kCmdOpenFolder:
             OpenScreenshotsFolder();
             break;
+        case kCmdCopyLog:
+            CopyLogToClipboard();
+            break;
         case kCmdExit:
             DestroyWindow(hiddenHwnd_);
             break;
@@ -1203,6 +1208,10 @@ private:
             CaptureActiveWindowScreenshot();
             break;
         case kHotkeyMirror:
+            if (!mirrorVisible_) {
+                // The app in front right now is the game the user means.
+                RememberForegroundNow();
+            }
             ToggleMirrorWindow();
             break;
         default:
@@ -1508,6 +1517,21 @@ private:
         lastForegroundHwnd_ = root;
     }
 
+    void RememberForegroundNow() {
+        HWND foreground = GetForegroundWindow();
+        OnForegroundChanged(foreground);
+        DWORD processId = 0;
+        if (foreground) {
+            GetWindowThreadProcessId(foreground, &processId);
+        }
+        AudioAppInfo info;
+        if (processId != 0 && DescribeProcess(processId, info)) {
+            Log(L"Window in front at hotkey: " + TargetLogLabel(info));
+        } else {
+            Log(L"Window in front at hotkey: PID " + std::to_wstring(processId) + L" (details unavailable)");
+        }
+    }
+
     void LoadAudioSettings() {
         // Fresh installs default to game-only audio: whatever app is in front when Ctrl+Alt+H is pressed.
         const DWORD mode = ReadSettingDword(kSettingAudioSource, static_cast<DWORD>(AudioSourceMode::ActiveApplication));
@@ -1517,6 +1541,8 @@ private:
         selectedAppExe_ = ReadSettingString(kSettingAudioApp);
         selectedAppName_ = ReadSettingString(kSettingAudioAppName);
         Log(L"Audio relay source: " + AudioSourceLabel());
+        Log(L"Windows build " + std::to_wstring(WindowsBuildNumber()) +
+            (HasPackageIdentity() ? L", running as installed package (setup.exe)" : L", running as portable exe (zip)"));
     }
 
     void SaveAudioSettings() const {
@@ -1673,7 +1699,14 @@ private:
         std::wstring error;
         if (!audioRelay_.Start(error, target.processId)) {
             Log(L"Process audio capture failed for " + label + L": " + error);
-            FailAppRelay(L"Couldn't capture audio from " + name + L". Stream audio is off. In the game, press Ctrl+Alt+H twice to retry. " + error);
+            const DWORD build = WindowsBuildNumber();
+            if (build != 0 && build < 20348) {
+                Log(L"Windows build " + std::to_wstring(build) + L" is older than 20348, which per-app audio capture requires.");
+                FailAppRelay(L"No game audio: this Windows version is too old for per-app audio. Windows 11 is required.");
+            } else {
+                FailAppRelay(L"No game audio: Windows refused to capture " + name +
+                    L". Tray menu > Copy log to clipboard, and send it for help.");
+            }
             return false;
         }
 
@@ -2002,6 +2035,67 @@ private:
         Log(L"Audio relay application selected: " + TargetLogLabel(app));
         DestroyWindow(pickerHwnd_);
         SetAudioSource(AudioSourceMode::SelectedApplication);
+    }
+
+    // ---- Troubleshooting ---------------------------------------------------------------------
+
+    // The installed (MSIX) build keeps its log in a hidden package folder, so copy it for the user.
+    void CopyLogToClipboard() {
+        const auto path = AppDataDirectory() / L"hdr-corrector.log";
+        std::ifstream file(path, std::ios::binary);
+        std::string bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        if (bytes.empty()) {
+            ShowErrorNotification(kAppName, L"The log file is empty or missing.");
+            return;
+        }
+
+        // Keep the most recent ~300 lines.
+        size_t start = bytes.size();
+        for (int lines = 0; start > 0 && lines < 300; --start) {
+            if (bytes[start - 1] == '\n') {
+                ++lines;
+            }
+        }
+        if (start > 0) {
+            bytes.erase(0, start);
+        }
+
+        const int length = MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), nullptr, 0);
+        std::wstring text(static_cast<size_t>(std::max(length, 0)), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, bytes.data(), static_cast<int>(bytes.size()), text.data(), length);
+        std::wstring withCrLf;
+        withCrLf.reserve(text.size() + text.size() / 40);
+        for (const wchar_t c : text) {
+            if (c == L'\n') {
+                withCrLf += L'\r';
+            }
+            withCrLf += c;
+        }
+
+        const size_t byteCount = (withCrLf.size() + 1) * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, byteCount);
+        if (!memory) {
+            ShowErrorNotification(kAppName, L"Could not copy the log.");
+            return;
+        }
+        void* locked = GlobalLock(memory);
+        std::memcpy(locked, withCrLf.c_str(), byteCount);
+        GlobalUnlock(memory);
+
+        if (!OpenClipboard(hiddenHwnd_)) {
+            GlobalFree(memory);
+            ShowErrorNotification(kAppName, L"Could not open the clipboard.");
+            return;
+        }
+        EmptyClipboard();
+        if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+            GlobalFree(memory);
+            CloseClipboard();
+            ShowErrorNotification(kAppName, L"Could not copy the log.");
+            return;
+        }
+        CloseClipboard();
+        ShowNotification(kAppName, L"Log copied. Paste it (Ctrl+V) into a message.");
     }
 
     // ---- Keep the mirror capturable in the background -----------------------------------------
