@@ -49,13 +49,13 @@ For Discord screen share, share the `HDR Corrector Stream Mirror` window instead
 
 ### Game-only audio (no Discord voice echo)
 
-By default the relay sends **all desktop audio**, which includes Discord voice chat, so viewers can hear themselves. To send only the game:
+By default the relay sends **only the game**: whatever app is in front when you press `Ctrl+Alt+H`. So the normal routine is: start the game, press `Ctrl+Alt+H` while in it, then share the `HDR Corrector Stream Mirror` window in Discord with sound on. Discord voice chat is never included. If no game is found, click into the game and press `Ctrl+Alt+H` twice.
 
-1. Right-click the tray icon > **Audio relay source**.
-2. Choose **Active application** (uses the app you were last in when the relay starts, e.g. press `Ctrl+Alt+H` while in the game) or **Select application...** (pick the game from a list; remembered between runs).
-3. Share the `HDR Corrector Stream Mirror` window in Discord with sound on.
+To change the source:
 
-Only the chosen program and its child processes are captured. Discord is never allowed as a source. If the chosen app cannot be captured, the relay turns itself off and shows an error instead of falling back to desktop audio. If the game closes, the relay waits and resumes automatically when it starts again. The tray menu shows the current relay status.
+Right-click the tray icon > **Audio relay source** and choose **Active application** (default), **Select application...** (pick one app from a list; remembered), or **All desktop audio** (the old behavior, which includes Discord voice).
+
+Only the chosen program and its child processes are captured. Discord is never allowed as a source. If the chosen app cannot be captured, stream audio stays off and an error is shown instead of falling back to desktop audio. If the game closes, the relay waits and resumes automatically when it starts again. The tray menu shows the current relay status.
 
 The mirror window cannot be minimized: minimizing sends it behind other windows instead, because Discord pauses a minimized window ("Switch to application to resume"). Close it with `Ctrl+Alt+H` when you are done.
 

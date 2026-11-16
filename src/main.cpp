@@ -1509,7 +1509,8 @@ private:
     }
 
     void LoadAudioSettings() {
-        const DWORD mode = ReadSettingDword(kSettingAudioSource, static_cast<DWORD>(AudioSourceMode::Desktop));
+        // Fresh installs default to game-only audio: whatever app is in front when Ctrl+Alt+H is pressed.
+        const DWORD mode = ReadSettingDword(kSettingAudioSource, static_cast<DWORD>(AudioSourceMode::ActiveApplication));
         audioSourceMode_ = mode <= static_cast<DWORD>(AudioSourceMode::SelectedApplication)
             ? static_cast<AudioSourceMode>(mode)
             : AudioSourceMode::Desktop;
@@ -1554,7 +1555,7 @@ private:
         }
 
         AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceDesktop, L"All desktop audio (includes Discord voice)");
-        AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceActive, L"Active application");
+        AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceActive, L"Active application (game in front when the mirror opens)");
         const std::wstring selectLabel = selectedAppName_.empty()
             ? std::wstring(L"Select application...")
             : L"Select application... (" + selectedAppName_ + L")";
@@ -1617,7 +1618,7 @@ private:
             // Locked once, here. Focus changes after this point do not move the relay.
             const DWORD processId = lastForegroundProcessId_;
             if (processId == 0) {
-                FailAppRelay(L"No active application found. Click into your game first, then turn the audio relay back on.");
+                FailAppRelay(L"No game found. Click into your game, then press Ctrl+Alt+H twice.");
                 return;
             }
             if (!DescribeProcess(processId, target)) {
@@ -1665,14 +1666,14 @@ private:
         const auto problem = AudioTargetProblem(target.processId);
         if (!problem.empty()) {
             Log(L"Audio relay target rejected: " + label + L": " + problem);
-            FailAppRelay(L"Can't relay " + name + L": " + problem);
+            FailAppRelay(L"Can't relay " + name + L": " + problem + L" Click into your game, then press Ctrl+Alt+H twice.");
             return false;
         }
 
         std::wstring error;
         if (!audioRelay_.Start(error, target.processId)) {
             Log(L"Process audio capture failed for " + label + L": " + error);
-            FailAppRelay(L"Couldn't capture audio from " + name + L". Relay is off. " + error);
+            FailAppRelay(L"Couldn't capture audio from " + name + L". Stream audio is off. In the game, press Ctrl+Alt+H twice to retry. " + error);
             return false;
         }
 
@@ -1694,7 +1695,6 @@ private:
     // Never fall back to desktop audio here: that would put Discord voice back into the stream.
     void FailAppRelay(const std::wstring& message) {
         StopAudioRelay();
-        audioRelayEnabled_ = false;
         audioStatus_ = L"Relay off: " + message;
         Log(L"Audio relay disabled: " + message);
         ShowErrorNotification(kAppName, message);
@@ -2495,7 +2495,7 @@ private:
     HWINEVENTHOOK foregroundHook_ = nullptr;
     DWORD lastForegroundProcessId_ = 0;
     HWND lastForegroundHwnd_ = nullptr;
-    AudioSourceMode audioSourceMode_ = AudioSourceMode::Desktop;
+    AudioSourceMode audioSourceMode_ = AudioSourceMode::ActiveApplication;
     std::wstring selectedAppExe_;
     std::wstring selectedAppName_;
     DWORD pickedProcessId_ = 0;
