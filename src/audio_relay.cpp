@@ -90,7 +90,7 @@ private:
     ComPtr<IUnknown> activatedInterface_;
 };
 
-HRESULT ActivateProcessLoopbackClient(ComPtr<IAudioClient>& audioClient) {
+HRESULT ActivateProcessLoopbackClient(DWORD targetProcessId, ComPtr<IAudioClient>& audioClient) {
     HANDLE completedEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!completedEvent) {
         return HRESULT_FROM_WIN32(GetLastError());
@@ -104,8 +104,15 @@ HRESULT ActivateProcessLoopbackClient(ComPtr<IAudioClient>& audioClient) {
 
     AUDIOCLIENT_ACTIVATION_PARAMS activationParams = {};
     activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+    if (targetProcessId == 0) {
+        // Desktop mode: everything except HDR Corrector's own output.
+        activationParams.ProcessLoopbackParams.TargetProcessId = GetCurrentProcessId();
+        activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+    } else {
+        // Application mode: only the selected process and its children (never Discord or this relay).
+        activationParams.ProcessLoopbackParams.TargetProcessId = targetProcessId;
+        activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+    }
 
     PROPVARIANT propVariant = {};
     propVariant.vt = VT_BLOB;
@@ -196,12 +203,13 @@ HRESULT CreateDefaultRenderClient(
 }
 
 HRESULT CreateLoopbackCaptureClient(
+    DWORD targetProcessId,
     WAVEFORMATEX* format,
     HANDLE captureEvent,
     ComPtr<IAudioClient>& captureClient,
     ComPtr<IAudioCaptureClient>& captureService) {
 
-    HRESULT hr = ActivateProcessLoopbackClient(captureClient);
+    HRESULT hr = ActivateProcessLoopbackClient(targetProcessId, captureClient);
     if (FAILED(hr)) {
         return hr;
     }
@@ -295,8 +303,9 @@ AudioRelay::~AudioRelay() {
     Stop();
 }
 
-bool AudioRelay::Start(std::wstring& error) {
+bool AudioRelay::Start(std::wstring& error, DWORD targetProcessId) {
     Stop();
+    targetProcessId_ = targetProcessId;
 
     stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     startedEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -409,7 +418,7 @@ void AudioRelay::Worker() {
         startupHr = CreateDefaultRenderClient(renderClient, renderService, &format, renderBufferFrames, renderEvent);
     }
     if (SUCCEEDED(startupHr)) {
-        startupHr = CreateLoopbackCaptureClient(format, captureEvent, captureClient, captureService);
+        startupHr = CreateLoopbackCaptureClient(targetProcessId_, format, captureEvent, captureClient, captureService);
     }
     if (SUCCEEDED(startupHr)) {
         BYTE* silence = nullptr;

@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "audio_relay.h"
+#include "audio_source.h"
 #include "clipboard.h"
 #include "platform.h"
 #include "resource.h"
@@ -61,6 +62,7 @@ constexpr wchar_t kRunValueName[] = L"HDRCorrector";
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kRenderMirrorMessage = WM_APP + 2;
+constexpr UINT kRestoreMirrorMessage = WM_APP + 3;
 constexpr UINT_PTR kTrayIconId = 1;
 constexpr int kHotkeyScreenshot = 100;
 constexpr int kHotkeyMirror = 101;
@@ -74,6 +76,28 @@ constexpr UINT kCmdOpenFolder = 204;
 constexpr UINT kCmdExit = 205;
 constexpr UINT kCmdAudioRelay = 206;
 constexpr UINT kCmdWindowScreenshot = 207;
+constexpr UINT kCmdAudioSourceDesktop = 208;
+constexpr UINT kCmdAudioSourceActive = 209;
+constexpr UINT kCmdAudioSourceSelect = 210;
+constexpr UINT kCmdAudioSourceStatus = 211;
+
+constexpr UINT_PTR kAudioWatchTimerId = 1;
+constexpr UINT kAudioWatchIntervalMs = 2000;
+
+constexpr wchar_t kPickerWindowClass[] = L"HDRCorrector.AppPicker";
+constexpr int kPickerListId = 300;
+constexpr int kPickerRefreshId = 301;
+
+constexpr wchar_t kSettingsKey[] = L"Software\\HDRCorrector";
+constexpr wchar_t kSettingAudioSource[] = L"AudioRelaySource";
+constexpr wchar_t kSettingAudioApp[] = L"AudioRelayApp";
+constexpr wchar_t kSettingAudioAppName[] = L"AudioRelayAppName";
+
+enum class AudioSourceMode : DWORD {
+    Desktop = 0,
+    ActiveApplication = 1,
+    SelectedApplication = 2,
+};
 
 constexpr DXGI_FORMAT kCaptureFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 constexpr DirectXPixelFormat kFramePoolFormat = DirectXPixelFormat::R16G16B16A16Float;
@@ -281,6 +305,44 @@ bool SetStartupEnabled(bool enabled) {
     }
 
     return true;
+}
+
+DWORD ReadSettingDword(const wchar_t* name, DWORD fallback) {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    return value;
+}
+
+std::wstring ReadSettingString(const wchar_t* name) {
+    wchar_t value[kRegistryValueBufferCharacters] = {};
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS) {
+        return {};
+    }
+    return value;
+}
+
+void WriteSettingDword(const wchar_t* name, DWORD value) {
+    const LONG result = RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &value, sizeof(value));
+    if (result != ERROR_SUCCESS) {
+        Log(L"Saving setting failed: " + LastErrorMessage(result));
+    }
+}
+
+void WriteSettingString(const wchar_t* name, const std::wstring& value) {
+    const LONG result = RegSetKeyValueW(
+        HKEY_CURRENT_USER,
+        kSettingsKey,
+        name,
+        REG_SZ,
+        value.c_str(),
+        static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    if (result != ERROR_SUCCESS) {
+        Log(L"Saving setting failed: " + LastErrorMessage(result));
+    }
 }
 
 HMONITOR PrimaryMonitor() {
@@ -618,12 +680,32 @@ public:
         taskbarCreatedMessage_ = RegisterWindowMessageW(L"TaskbarCreated");
         AddTrayIcon();
         RegisterHotkeys();
+        LoadAudioSettings();
+
+        // Remember the last application the user was in so "Active application" can pick the game
+        // even when the mirror is started from the tray menu.
+        foregroundOwner_ = this;
+        foregroundHook_ = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            nullptr,
+            &App::ForegroundEventProc,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        if (!foregroundHook_) {
+            Log(L"SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed: " + LastErrorMessage(GetLastError()));
+        }
+        OnForegroundChanged(GetForegroundWindow());
         return true;
     }
 
     int Run() {
         MSG message = {};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (pickerHwnd_ && IsDialogMessageW(pickerHwnd_, &message)) {
+                continue;
+            }
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -679,6 +761,11 @@ private:
         case kTrayMessage:
             HandleTrayMessage(lparam);
             return 0;
+        case WM_TIMER:
+            if (wparam == kAudioWatchTimerId) {
+                OnAudioWatchTimer();
+            }
+            return 0;
         case WM_DESTROY:
             Shutdown();
             PostQuitMessage(0);
@@ -691,7 +778,24 @@ private:
     LRESULT MirrorWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
         switch (message) {
         case WM_SIZE:
+            if (wparam == SIZE_MINIMIZED) {
+                // Discord pauses ("Switch to application to resume") when a shared window is minimized.
+                PostMessageW(hwnd, kRestoreMirrorMessage, 0, 0);
+                return 0;
+            }
             ResizeSwapChain();
+            return 0;
+        case WM_SYSCOMMAND:
+            if ((wparam & 0xFFF0) == SC_MINIMIZE) {
+                SendMirrorToBack();
+                return 0;
+            }
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        case kRestoreMirrorMessage:
+            if (mirrorVisible_ && IsIconic(hwnd)) {
+                ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                SendMirrorToBack();
+            }
             return 0;
         case WM_PAINT: {
             PAINTSTRUCT paint = {};
@@ -706,7 +810,7 @@ private:
         case WM_CLOSE:
             ShowWindow(hwnd, SW_HIDE);
             mirrorVisible_ = false;
-            audioRelay_.Stop();
+            StopAudioRelay();
             StopCapture();
             UpdateTrayTooltip();
             return 0;
@@ -742,6 +846,21 @@ private:
 
         if (!RegisterClassExW(&mirrorClass)) {
             Log(L"RegisterClassExW mirror failed: " + LastErrorMessage(GetLastError()));
+            return false;
+        }
+
+        WNDCLASSEXW pickerClass = {};
+        pickerClass.cbSize = sizeof(pickerClass);
+        pickerClass.lpfnWndProc = &App::PickerWindowProcSetup;
+        pickerClass.hInstance = instance_;
+        pickerClass.lpszClassName = kPickerWindowClass;
+        pickerClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        pickerClass.hbrBackground = reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_BTNFACE + 1));
+        pickerClass.hIcon = AppIcon();
+        pickerClass.hIconSm = AppSmallIcon();
+
+        if (!RegisterClassExW(&pickerClass)) {
+            Log(L"RegisterClassExW picker failed: " + LastErrorMessage(GetLastError()));
             return false;
         }
 
@@ -957,6 +1076,9 @@ private:
         if (!mirrorVisible_) {
             return L"HDR Corrector";
         }
+        if (audioRelay_.IsRunning() && audioSourceMode_ != AudioSourceMode::Desktop && !audioStatus_.empty()) {
+            return L"HDR Corrector - mirror visible\n" + audioStatus_;
+        }
         return audioRelay_.IsRunning() ? L"HDR Corrector - mirror and audio relay visible" : L"HDR Corrector - mirror visible";
     }
 
@@ -969,6 +1091,18 @@ private:
         CopyTruncated(data.szInfoTitle, title);
         CopyTruncated(data.szInfo, message);
         data.dwInfoFlags = NIIF_INFO;
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+
+    void ShowErrorNotification(const std::wstring& title, const std::wstring& message) const {
+        NOTIFYICONDATAW data = {};
+        data.cbSize = sizeof(data);
+        data.hWnd = hiddenHwnd_;
+        data.uID = kTrayIconId;
+        data.uFlags = NIF_INFO;
+        CopyTruncated(data.szInfoTitle, title);
+        CopyTruncated(data.szInfo, message);
+        data.dwInfoFlags = NIIF_ERROR;
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 
@@ -1006,7 +1140,8 @@ private:
             menu,
             MF_STRING | (audioRelayEnabled_ ? MF_CHECKED : MF_UNCHECKED),
             kCmdAudioRelay,
-            L"Relay desktop audio with mirror");
+            L"Relay audio with mirror");
+        AppendAudioSourceMenu(menu);
         AppendMenuW(menu, MF_STRING, kCmdSelectMonitor, L"Use monitor under cursor");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), kCmdStartup, L"Run at startup");
@@ -1038,6 +1173,15 @@ private:
             break;
         case kCmdAudioRelay:
             ToggleAudioRelay();
+            break;
+        case kCmdAudioSourceDesktop:
+            SetAudioSource(AudioSourceMode::Desktop);
+            break;
+        case kCmdAudioSourceActive:
+            SetAudioSource(AudioSourceMode::ActiveApplication);
+            break;
+        case kCmdAudioSourceSelect:
+            ShowAppPicker();
             break;
         case kCmdOpenFolder:
             OpenScreenshotsFolder();
@@ -1327,33 +1471,317 @@ private:
             RenderMirror();
             StartAudioRelayForMirror();
         } else {
-            audioRelay_.Stop();
+            StopAudioRelay();
             StopCapture();
         }
         UpdateTrayTooltip();
     }
 
-    void StartAudioRelayForMirror() {
-        if (!audioRelayEnabled_ || audioRelay_.IsRunning()) {
+    // ---- Audio relay source selection -------------------------------------------------------
+
+    static void CALLBACK ForegroundEventProc(HWINEVENTHOOK, DWORD, HWND hwnd, LONG objectId, LONG, DWORD, DWORD) {
+        if (foregroundOwner_ && objectId == OBJID_WINDOW) {
+            foregroundOwner_->OnForegroundChanged(hwnd);
+        }
+    }
+
+    void OnForegroundChanged(HWND hwnd) {
+        if (!hwnd) {
             return;
+        }
+        HWND root = GetAncestor(hwnd, GA_ROOTOWNER);
+        if (!root) {
+            root = hwnd;
+        }
+        DWORD processId = 0;
+        GetWindowThreadProcessId(root, &processId);
+        if (processId == 0 || processId == GetCurrentProcessId()) {
+            return;
+        }
+
+        AudioAppInfo info;
+        if (DescribeProcess(processId, info) && (IsShellExe(info.exeName) || IsDiscordExe(info.exeName))) {
+            // Taskbar, Start menu and Discord never count as "the active application".
+            return;
+        }
+        lastForegroundProcessId_ = processId;
+        lastForegroundHwnd_ = root;
+    }
+
+    void LoadAudioSettings() {
+        const DWORD mode = ReadSettingDword(kSettingAudioSource, static_cast<DWORD>(AudioSourceMode::Desktop));
+        audioSourceMode_ = mode <= static_cast<DWORD>(AudioSourceMode::SelectedApplication)
+            ? static_cast<AudioSourceMode>(mode)
+            : AudioSourceMode::Desktop;
+        selectedAppExe_ = ReadSettingString(kSettingAudioApp);
+        selectedAppName_ = ReadSettingString(kSettingAudioAppName);
+        Log(L"Audio relay source: " + AudioSourceLabel());
+    }
+
+    void SaveAudioSettings() const {
+        WriteSettingDword(kSettingAudioSource, static_cast<DWORD>(audioSourceMode_));
+        WriteSettingString(kSettingAudioApp, selectedAppExe_);
+        WriteSettingString(kSettingAudioAppName, selectedAppName_);
+    }
+
+    std::wstring AudioSourceLabel() const {
+        switch (audioSourceMode_) {
+        case AudioSourceMode::ActiveApplication:
+            return L"Active application";
+        case AudioSourceMode::SelectedApplication:
+            return selectedAppExe_.empty()
+                ? L"Selected application (none chosen)"
+                : L"Selected application: " + selectedAppName_ + L" (" + selectedAppExe_ + L")";
+        default:
+            return L"All desktop audio";
+        }
+    }
+
+    static std::wstring TargetName(const AudioAppInfo& target) {
+        const auto name = AudioAppDisplayName(target);
+        return name.empty() ? L"PID " + std::to_wstring(target.processId) : name;
+    }
+
+    static std::wstring TargetLogLabel(const AudioAppInfo& target) {
+        return TargetName(target) + L" (" + (target.exeName.empty() ? L"unknown exe" : target.exeName) + L", PID " +
+            std::to_wstring(target.processId) + L")";
+    }
+
+    void AppendAudioSourceMenu(HMENU menu) {
+        HMENU sourceMenu = CreatePopupMenu();
+        if (!sourceMenu) {
+            return;
+        }
+
+        AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceDesktop, L"All desktop audio (includes Discord voice)");
+        AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceActive, L"Active application");
+        const std::wstring selectLabel = selectedAppName_.empty()
+            ? std::wstring(L"Select application...")
+            : L"Select application... (" + selectedAppName_ + L")";
+        AppendMenuW(sourceMenu, MF_STRING, kCmdAudioSourceSelect, selectLabel.c_str());
+
+        UINT current = kCmdAudioSourceDesktop;
+        if (audioSourceMode_ == AudioSourceMode::ActiveApplication) {
+            current = kCmdAudioSourceActive;
+        } else if (audioSourceMode_ == AudioSourceMode::SelectedApplication) {
+            current = kCmdAudioSourceSelect;
+        }
+        CheckMenuRadioItem(sourceMenu, kCmdAudioSourceDesktop, kCmdAudioSourceSelect, current, MF_BYCOMMAND);
+
+        if (!audioStatus_.empty()) {
+            AppendMenuW(sourceMenu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(sourceMenu, MF_STRING | MF_GRAYED, kCmdAudioSourceStatus, audioStatus_.c_str());
+        }
+
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sourceMenu), L"Audio relay source");
+    }
+
+    void SetAudioSource(AudioSourceMode mode) {
+        audioSourceMode_ = mode;
+        SaveAudioSettings();
+        Log(L"Audio relay source changed: " + AudioSourceLabel());
+
+        // Choosing a source means the user wants the relay on.
+        audioRelayEnabled_ = true;
+        StopAudioRelay();
+        if (mirrorVisible_) {
+            StartAudioRelayForMirror();
+        } else {
+            ShowNotification(kAppName, L"Audio source: " + AudioSourceLabel() + L". It will start with the stream mirror.");
+        }
+        UpdateTrayTooltip();
+    }
+
+    void StartAudioRelayForMirror() {
+        if (!audioRelayEnabled_ || audioRelay_.IsRunning() || waitingForRelayTarget_) {
+            return;
+        }
+
+        if (audioSourceMode_ == AudioSourceMode::Desktop) {
+            std::wstring error;
+            if (!audioRelay_.Start(error)) {
+                Log(L"Audio relay failed: " + error);
+                ShowNotification(kAppName, L"Stream mirror started, but audio relay failed. See log for details.");
+                return;
+            }
+
+            Log(L"Audio relay started: all desktop audio.");
+            audioStatus_ = L"Relaying all desktop audio";
+            ShowNotification(kAppName, L"Stream mirror started with desktop audio relay.");
+            UpdateTrayTooltip();
+            return;
+        }
+
+        AudioAppInfo target;
+        if (audioSourceMode_ == AudioSourceMode::ActiveApplication) {
+            // Locked once, here. Focus changes after this point do not move the relay.
+            const DWORD processId = lastForegroundProcessId_;
+            if (processId == 0) {
+                FailAppRelay(L"No active application found. Click into your game first, then turn the audio relay back on.");
+                return;
+            }
+            if (!DescribeProcess(processId, target)) {
+                target.processId = processId;
+            }
+        } else {
+            if (selectedAppExe_.empty()) {
+                FailAppRelay(L"No application selected. Use Audio relay source > Select application.");
+                return;
+            }
+
+            DWORD processId = 0;
+            if (pickedProcessId_ != 0) {
+                AudioAppInfo picked;
+                if (DescribeProcess(pickedProcessId_, picked) && _wcsicmp(picked.exeName.c_str(), selectedAppExe_.c_str()) == 0) {
+                    processId = pickedProcessId_;
+                }
+                pickedProcessId_ = 0;
+            }
+            if (processId == 0) {
+                processId = FindProcessByExeName(selectedAppExe_);
+            }
+            if (processId == 0) {
+                BeginWaitingForTarget(selectedAppExe_, selectedAppName_);
+                ShowNotification(kAppName, L"Waiting for " + selectedAppName_ + L" to start. Audio relay will begin automatically.");
+                return;
+            }
+            if (!DescribeProcess(processId, target)) {
+                target.processId = processId;
+                target.exeName = selectedAppExe_;
+            }
+            if (target.friendlyName.empty()) {
+                target.friendlyName = selectedAppName_;
+            }
+        }
+
+        StartAppRelay(target);
+    }
+
+    bool StartAppRelay(const AudioAppInfo& target) {
+        const auto name = TargetName(target);
+        const auto label = TargetLogLabel(target);
+        Log(L"Audio relay target: " + label);
+
+        const auto problem = AudioTargetProblem(target.processId);
+        if (!problem.empty()) {
+            Log(L"Audio relay target rejected: " + label + L": " + problem);
+            FailAppRelay(L"Can't relay " + name + L": " + problem);
+            return false;
         }
 
         std::wstring error;
-        if (!audioRelay_.Start(error)) {
-            Log(L"Audio relay failed: " + error);
-            ShowNotification(kAppName, L"Stream mirror started, but audio relay failed. See log for details.");
+        if (!audioRelay_.Start(error, target.processId)) {
+            Log(L"Process audio capture failed for " + label + L": " + error);
+            FailAppRelay(L"Couldn't capture audio from " + name + L". Relay is off. " + error);
+            return false;
+        }
+
+        CloseRelayTargetHandle();
+        relayTargetProcess_ = OpenProcess(SYNCHRONIZE, FALSE, target.processId);
+        if (!relayTargetProcess_) {
+            Log(L"Could not watch " + label + L" for exit: " + LastErrorMessage(GetLastError()));
+        }
+        relayTarget_ = target;
+        waitingForRelayTarget_ = false;
+        audioStatus_ = L"Relaying " + name + L" only (PID " + std::to_wstring(target.processId) + L")";
+        Log(L"Audio relay started: capturing only " + label + L" and its child processes.");
+        ShowNotification(kAppName, L"Relaying audio from " + name + L" only. Discord voice chat is not included.");
+        SetTimer(hiddenHwnd_, kAudioWatchTimerId, kAudioWatchIntervalMs, nullptr);
+        UpdateTrayTooltip();
+        return true;
+    }
+
+    // Never fall back to desktop audio here: that would put Discord voice back into the stream.
+    void FailAppRelay(const std::wstring& message) {
+        StopAudioRelay();
+        audioRelayEnabled_ = false;
+        audioStatus_ = L"Relay off: " + message;
+        Log(L"Audio relay disabled: " + message);
+        ShowErrorNotification(kAppName, message);
+        UpdateTrayTooltip();
+    }
+
+    void BeginWaitingForTarget(const std::wstring& exeName, const std::wstring& name) {
+        relayTarget_ = {};
+        relayTarget_.exeName = exeName;
+        relayTarget_.friendlyName = name;
+        waitingForRelayTarget_ = true;
+        audioStatus_ = L"Waiting for " + (name.empty() ? exeName : name) + L" to start";
+        Log(L"Audio relay waiting for " + exeName + L" to start.");
+        SetTimer(hiddenHwnd_, kAudioWatchTimerId, kAudioWatchIntervalMs, nullptr);
+        UpdateTrayTooltip();
+    }
+
+    void OnAudioWatchTimer() {
+        if (!mirrorVisible_ || !audioRelayEnabled_ || audioSourceMode_ == AudioSourceMode::Desktop) {
+            KillTimer(hiddenHwnd_, kAudioWatchTimerId);
             return;
         }
 
-        ShowNotification(kAppName, L"Stream mirror started with desktop audio relay.");
-        UpdateTrayTooltip();
+        if (waitingForRelayTarget_) {
+            const DWORD processId = FindProcessByExeName(relayTarget_.exeName);
+            if (processId == 0) {
+                return;
+            }
+            AudioAppInfo target;
+            if (!DescribeProcess(processId, target)) {
+                target.processId = processId;
+                target.exeName = relayTarget_.exeName;
+            }
+            if (target.friendlyName.empty()) {
+                target.friendlyName = relayTarget_.friendlyName;
+            }
+            Log(L"Audio relay source is running again: " + TargetLogLabel(target));
+            waitingForRelayTarget_ = false;
+            StartAppRelay(target);
+            return;
+        }
+
+        const bool targetExited = relayTargetProcess_ && WaitForSingleObject(relayTargetProcess_, 0) == WAIT_OBJECT_0;
+        if (targetExited) {
+            const auto name = TargetName(relayTarget_);
+            Log(L"Audio relay source exited: " + TargetLogLabel(relayTarget_));
+            audioRelay_.Stop();
+            CloseRelayTargetHandle();
+            if (relayTarget_.exeName.empty()) {
+                FailAppRelay(name + L" closed.");
+                return;
+            }
+            BeginWaitingForTarget(relayTarget_.exeName, name);
+            ShowNotification(kAppName, name + L" closed. Audio relay will resume when it starts again.");
+            return;
+        }
+
+        if (!audioRelay_.IsRunning()) {
+            Log(L"Audio relay stopped unexpectedly; restarting capture of " + TargetLogLabel(relayTarget_));
+            const AudioAppInfo target = relayTarget_;
+            StartAppRelay(target);
+        }
+    }
+
+    void CloseRelayTargetHandle() {
+        if (relayTargetProcess_) {
+            CloseHandle(relayTargetProcess_);
+            relayTargetProcess_ = nullptr;
+        }
+    }
+
+    void StopAudioRelay() {
+        audioRelay_.Stop();
+        if (hiddenHwnd_) {
+            KillTimer(hiddenHwnd_, kAudioWatchTimerId);
+        }
+        CloseRelayTargetHandle();
+        waitingForRelayTarget_ = false;
+        relayTarget_ = {};
+        audioStatus_.clear();
     }
 
     void ToggleAudioRelay() {
         audioRelayEnabled_ = !audioRelayEnabled_;
 
         if (!audioRelayEnabled_) {
-            audioRelay_.Stop();
+            StopAudioRelay();
             ShowNotification(kAppName, L"Audio relay disabled.");
         } else if (mirrorVisible_) {
             StartAudioRelayForMirror();
@@ -1362,6 +1790,232 @@ private:
         }
 
         UpdateTrayTooltip();
+    }
+
+    // ---- Application picker window -----------------------------------------------------------
+
+    static LRESULT CALLBACK PickerWindowProcSetup(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        if (message == WM_NCCREATE) {
+            auto* create = reinterpret_cast<CREATESTRUCTW*>(lparam);
+            auto* app = static_cast<App*>(create->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&App::PickerWindowProcThunk));
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    static LRESULT CALLBACK PickerWindowProcThunk(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        auto* app = reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        return app ? app->PickerWindowProc(hwnd, message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    LRESULT PickerWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+        switch (message) {
+        case WM_COMMAND: {
+            const int id = LOWORD(wparam);
+            const int code = HIWORD(wparam);
+            if ((id == kPickerListId && code == LBN_DBLCLK) || id == IDOK) {
+                AcceptPickerSelection();
+            } else if (id == kPickerRefreshId) {
+                RefreshPicker();
+            } else if (id == IDCANCEL) {
+                DestroyWindow(hwnd);
+            }
+            return 0;
+        }
+        case WM_CLOSE:
+            DestroyWindow(hwnd);
+            return 0;
+        case WM_DESTROY:
+            pickerHwnd_ = nullptr;
+            pickerList_ = nullptr;
+            if (pickerFont_) {
+                DeleteObject(pickerFont_);
+                pickerFont_ = nullptr;
+            }
+            return 0;
+        default:
+            return DefWindowProcW(hwnd, message, wparam, lparam);
+        }
+    }
+
+    void ShowAppPicker() {
+        if (pickerHwnd_) {
+            RefreshPicker();
+            ShowWindow(pickerHwnd_, SW_SHOWNORMAL);
+            SetForegroundWindow(pickerHwnd_);
+            return;
+        }
+
+        const UINT dpi = GetDpiForSystem();
+        auto scale = [dpi](int value) { return MulDiv(value, static_cast<int>(dpi), 96); };
+        const int width = scale(500);
+        const int height = scale(420);
+
+        POINT cursor = {};
+        GetCursorPos(&cursor);
+        MONITORINFO monitorInfo = {};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &monitorInfo);
+        const RECT& work = monitorInfo.rcWork;
+        const int x = work.left + ((work.right - work.left) - width) / 2;
+        const int y = work.top + ((work.bottom - work.top) - height) / 2;
+
+        pickerHwnd_ = CreateWindowExW(
+            WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+            kPickerWindowClass,
+            L"HDR Corrector - Choose audio source",
+            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+            x,
+            y,
+            width,
+            height,
+            nullptr,
+            nullptr,
+            instance_,
+            this);
+        if (!pickerHwnd_) {
+            Log(L"Create app picker failed: " + LastErrorMessage(GetLastError()));
+            return;
+        }
+
+        NONCLIENTMETRICSW metrics = {};
+        metrics.cbSize = sizeof(metrics);
+        if (SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)) {
+            pickerFont_ = CreateFontIndirectW(&metrics.lfMessageFont);
+        }
+
+        RECT client = {};
+        GetClientRect(pickerHwnd_, &client);
+        const int margin = scale(12);
+        const int buttonWidth = scale(110);
+        const int buttonHeight = scale(28);
+        const int labelHeight = scale(40);
+        const int innerWidth = client.right - 2 * margin;
+        const int buttonsTop = client.bottom - margin - buttonHeight;
+
+        auto createChild = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int cx, int cy, int cw, int ch, int id) {
+            HWND child = CreateWindowExW(
+                cls == std::wstring(L"LISTBOX") ? WS_EX_CLIENTEDGE : 0,
+                cls,
+                text,
+                WS_CHILD | WS_VISIBLE | style,
+                cx,
+                cy,
+                cw,
+                ch,
+                pickerHwnd_,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                instance_,
+                nullptr);
+            if (child && pickerFont_) {
+                SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(pickerFont_), TRUE);
+            }
+            return child;
+        };
+
+        createChild(
+            L"STATIC",
+            L"Pick your game. Only its audio (and its child processes) will be relayed to the stream. "
+            L"Discord voice chat is never included.",
+            0,
+            margin,
+            margin,
+            innerWidth,
+            labelHeight,
+            -1);
+        pickerList_ = createChild(
+            L"LISTBOX",
+            L"",
+            WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            margin,
+            margin + labelHeight + scale(4),
+            innerWidth,
+            buttonsTop - margin - (margin + labelHeight + scale(4)),
+            kPickerListId);
+        createChild(L"BUTTON", L"Refresh", WS_TABSTOP | BS_PUSHBUTTON, margin, buttonsTop, buttonWidth, buttonHeight, kPickerRefreshId);
+        createChild(
+            L"BUTTON",
+            L"Use this app",
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+            client.right - margin - 2 * buttonWidth - scale(8),
+            buttonsTop,
+            buttonWidth,
+            buttonHeight,
+            IDOK);
+        createChild(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, client.right - margin - buttonWidth, buttonsTop, buttonWidth, buttonHeight, IDCANCEL);
+
+        RefreshPicker();
+        ShowWindow(pickerHwnd_, SW_SHOWNORMAL);
+        SetForegroundWindow(pickerHwnd_);
+        SetFocus(pickerList_);
+    }
+
+    void RefreshPicker() {
+        if (!pickerList_) {
+            return;
+        }
+        pickerApps_ = ListCapturableApplications();
+        SendMessageW(pickerList_, LB_RESETCONTENT, 0, 0);
+
+        int preselect = -1;
+        for (size_t i = 0; i < pickerApps_.size(); ++i) {
+            const auto& app = pickerApps_[i];
+            std::wstring text = AudioAppDisplayName(app) + L"    -    " + app.exeName + L"  (PID " + std::to_wstring(app.processId) + L")";
+            if (!app.windowTitle.empty() && app.windowTitle != AudioAppDisplayName(app)) {
+                text += L"    \"" + app.windowTitle + L"\"";
+            }
+            SendMessageW(pickerList_, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(text.c_str()));
+            // LB_ADDSTRING appends because the list box is unsorted, so indices stay aligned with pickerApps_.
+            if (preselect < 0 && !selectedAppExe_.empty() && _wcsicmp(app.exeName.c_str(), selectedAppExe_.c_str()) == 0) {
+                preselect = static_cast<int>(i);
+            }
+        }
+        if (preselect < 0) {
+            for (size_t i = 0; i < pickerApps_.size(); ++i) {
+                if (pickerApps_[i].processId == lastForegroundProcessId_) {
+                    preselect = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+        if (preselect >= 0) {
+            SendMessageW(pickerList_, LB_SETCURSEL, static_cast<WPARAM>(preselect), 0);
+        }
+    }
+
+    void AcceptPickerSelection() {
+        if (!pickerList_) {
+            return;
+        }
+        const LRESULT selection = SendMessageW(pickerList_, LB_GETCURSEL, 0, 0);
+        if (selection == LB_ERR || static_cast<size_t>(selection) >= pickerApps_.size()) {
+            MessageBeep(MB_ICONWARNING);
+            return;
+        }
+
+        const AudioAppInfo app = pickerApps_[static_cast<size_t>(selection)];
+        selectedAppExe_ = app.exeName;
+        selectedAppName_ = AudioAppDisplayName(app);
+        pickedProcessId_ = app.processId;
+        Log(L"Audio relay application selected: " + TargetLogLabel(app));
+        DestroyWindow(pickerHwnd_);
+        SetAudioSource(AudioSourceMode::SelectedApplication);
+    }
+
+    // ---- Keep the mirror capturable in the background -----------------------------------------
+
+    // Minimizing is turned into "send to back" so Discord never sees a minimized window.
+    void SendMirrorToBack() {
+        if (!mirrorHwnd_) {
+            return;
+        }
+        const bool wasForeground = GetForegroundWindow() == mirrorHwnd_;
+        SetWindowPos(mirrorHwnd_, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (wasForeground && lastForegroundHwnd_ && IsWindow(lastForegroundHwnd_)) {
+            SetForegroundWindow(lastForegroundHwnd_);
+        }
     }
 
     void SelectMonitorUnderCursor() {
@@ -1795,7 +2449,15 @@ private:
         UnregisterHotKey(hiddenHwnd_, kHotkeyWindowScreenshot);
         UnregisterHotKey(hiddenHwnd_, kHotkeyMirror);
         StopCapture();
-        audioRelay_.Stop();
+        StopAudioRelay();
+        if (foregroundHook_) {
+            UnhookWinEvent(foregroundHook_);
+            foregroundHook_ = nullptr;
+        }
+        foregroundOwner_ = nullptr;
+        if (pickerHwnd_) {
+            DestroyWindow(pickerHwnd_);
+        }
 
         if (mirrorHwnd_) {
             DestroyWindow(mirrorHwnd_);
@@ -1827,6 +2489,24 @@ private:
     bool borderlessCaptureAccessChecked_ = false;
     bool borderlessCaptureAllowed_ = false;
     AudioRelay audioRelay_;
+
+    // Audio relay source selection.
+    static inline App* foregroundOwner_ = nullptr;
+    HWINEVENTHOOK foregroundHook_ = nullptr;
+    DWORD lastForegroundProcessId_ = 0;
+    HWND lastForegroundHwnd_ = nullptr;
+    AudioSourceMode audioSourceMode_ = AudioSourceMode::Desktop;
+    std::wstring selectedAppExe_;
+    std::wstring selectedAppName_;
+    DWORD pickedProcessId_ = 0;
+    AudioAppInfo relayTarget_;
+    HANDLE relayTargetProcess_ = nullptr;
+    bool waitingForRelayTarget_ = false;
+    std::wstring audioStatus_;
+    HWND pickerHwnd_ = nullptr;
+    HWND pickerList_ = nullptr;
+    HFONT pickerFont_ = nullptr;
+    std::vector<AudioAppInfo> pickerApps_;
 
     winrt::com_ptr<ID3D11Device> d3dDevice_;
     winrt::com_ptr<ID3D11DeviceContext> d3dContext_;

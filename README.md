@@ -47,7 +47,19 @@ Hotkeys:
 
 For Discord screen share, share the `HDR Corrector Stream Mirror` window instead of sharing the HDR monitor directly. The audio relay starts with the mirror by default and republishes desktop audio from HDR Corrector's own process so Discord has an application audio source to capture.
 
-If you hear local echo or doubled audio, right-click the tray icon and uncheck **Relay desktop audio with mirror**. You can also lower or mute **HDR Corrector Stream Audio** in the Windows volume mixer if Discord still receives the stream audio on your setup.
+### Game-only audio (no Discord voice echo)
+
+By default the relay sends **all desktop audio**, which includes Discord voice chat, so viewers can hear themselves. To send only the game:
+
+1. Right-click the tray icon > **Audio relay source**.
+2. Choose **Active application** (uses the app you were last in when the relay starts, e.g. press `Ctrl+Alt+H` while in the game) or **Select application...** (pick the game from a list; remembered between runs).
+3. Share the `HDR Corrector Stream Mirror` window in Discord with sound on.
+
+Only the chosen program and its child processes are captured. Discord is never allowed as a source. If the chosen app cannot be captured, the relay turns itself off and shows an error instead of falling back to desktop audio. If the game closes, the relay waits and resumes automatically when it starts again. The tray menu shows the current relay status.
+
+The mirror window cannot be minimized: minimizing sends it behind other windows instead, because Discord pauses a minimized window ("Switch to application to resume"). Close it with `Ctrl+Alt+H` when you are done.
+
+If you hear local echo or doubled audio, right-click the tray icon and uncheck **Relay audio with mirror**. You can also lower or mute **HDR Corrector Stream Audio** in the Windows volume mixer if Discord still receives the stream audio on your setup.
 
 The portable build uses the normal Windows capture border while the mirror is active. The MSIX build requests Windows borderless-capture consent on first capture; if Windows grants it, the mirror can run without the colored capture border. If consent is denied, capture still works with the border.
 
@@ -77,7 +89,7 @@ HDR Corrector keeps the pipeline small and local:
 2. For screenshots, it captures either the selected monitor or the active window, saves the original HDR frame as `.jxr`, then tone maps the same frame into an SDR `.preview.png`.
 3. The SDR preview is copied to the clipboard in multiple formats: Windows bitmap formats, encoded PNG formats, and a file-drop reference to the saved preview PNG for apps that prefer pasted files.
 4. For live sharing, it renders the HDR capture stream into a separate D3D11 mirror window with GPU tone mapping. Apps such as Discord can share that window instead of capturing the HDR monitor directly.
-5. When the audio relay is enabled, it uses WASAPI process loopback to capture desktop audio while excluding HDR Corrector's own process, then renders that audio from an HDR Corrector audio session. This gives application-based stream capture a matching audio source without a driver or Discord injection.
+5. When the audio relay is enabled, it uses WASAPI process loopback to capture desktop audio while excluding HDR Corrector's own process, then renders that audio from an HDR Corrector audio session. In application mode it instead uses `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` to capture only the selected app's process tree. This gives application-based stream capture a matching audio source without a driver or Discord injection.
 6. In the MSIX build, the app declares `graphicsCaptureWithoutBorder` and requests Windows consent for borderless capture before starting a capture session. The portable build cannot use that packaged capability.
 
 ## Design

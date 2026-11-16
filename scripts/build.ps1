@@ -103,7 +103,9 @@ $compileSuffix = $sourceArguments + @(
     "d3d11.lib",
     "dxgi.lib",
     "d3dcompiler.lib",
-    "runtimeobject.lib"
+    "runtimeobject.lib",
+    "version.lib",
+    "dwmapi.lib"
 )
 
 $resourceCompile = @(
