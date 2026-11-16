@@ -11,6 +11,7 @@
 #include <audioclientactivationparams.h>
 #include <audiopolicy.h>
 #include <mmdeviceapi.h>
+#include <functiondiscoverykeys_devpkey.h>
 #include <propidl.h>
 #include <wrl/client.h>
 
@@ -147,7 +148,8 @@ HRESULT CreateDefaultRenderClient(
     WAVEFORMATEX** format,
     UINT32& bufferFrames,
     HANDLE renderEvent,
-    const WAVEFORMATEX* fixedFormat = nullptr) {
+    const WAVEFORMATEX* fixedFormat,
+    const std::wstring& deviceId) {
 
     ComPtr<IMMDeviceEnumerator> enumerator;
     HRESULT hr = CoCreateInstance(
@@ -160,9 +162,22 @@ HRESULT CreateDefaultRenderClient(
     }
 
     ComPtr<IMMDevice> device;
-    hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-    if (FAILED(hr)) {
-        return hr;
+    if (!deviceId.empty()) {
+        hr = enumerator->GetDevice(deviceId.c_str(), &device);
+        DWORD state = 0;
+        if (SUCCEEDED(hr) && (FAILED(device->GetState(&state)) || state != DEVICE_STATE_ACTIVE)) {
+            hr = E_NOTFOUND;
+        }
+        if (FAILED(hr)) {
+            Log(L"Chosen relay output device is unavailable (" + HResultMessage(hr) + L"); using the Windows default.");
+            device.Reset();
+        }
+    }
+    if (!device) {
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        if (FAILED(hr)) {
+            return hr;
+        }
     }
 
     hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &renderClient);
@@ -356,6 +371,62 @@ HRESULT RelayFrames(
 
 }  // namespace
 
+std::vector<AudioOutputDevice> ListAudioOutputDevices() {
+    std::vector<AudioOutputDevice> devices;
+    ComPtr<IMMDeviceEnumerator> enumerator;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator)))) {
+        return devices;
+    }
+
+    std::wstring defaultId;
+    ComPtr<IMMDevice> defaultDevice;
+    if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &defaultDevice))) {
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(defaultDevice->GetId(&id)) && id) {
+            defaultId = id;
+            CoTaskMemFree(id);
+        }
+    }
+
+    ComPtr<IMMDeviceCollection> collection;
+    if (FAILED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
+        return devices;
+    }
+    UINT count = 0;
+    collection->GetCount(&count);
+    for (UINT i = 0; i < count; ++i) {
+        ComPtr<IMMDevice> device;
+        if (FAILED(collection->Item(i, &device))) {
+            continue;
+        }
+        AudioOutputDevice info;
+        LPWSTR id = nullptr;
+        if (SUCCEEDED(device->GetId(&id)) && id) {
+            info.id = id;
+            CoTaskMemFree(id);
+        }
+        ComPtr<IPropertyStore> properties;
+        if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, &properties))) {
+            PROPVARIANT name;
+            PropVariantInit(&name);
+            if (SUCCEEDED(properties->GetValue(PKEY_Device_FriendlyName, &name)) && name.vt == VT_LPWSTR && name.pwszVal) {
+                info.name = name.pwszVal;
+            }
+            PropVariantClear(&name);
+        }
+        if (info.name.empty()) {
+            info.name = L"Audio device " + std::to_wstring(i + 1);
+        }
+        info.isDefault = !defaultId.empty() && info.id == defaultId;
+        devices.push_back(std::move(info));
+    }
+    return devices;
+}
+
+void AudioRelay::SetOutputDevice(const std::wstring& deviceId) {
+    outputDeviceId_ = deviceId;
+}
+
 AudioRelay::~AudioRelay() {
     Stop();
 }
@@ -508,7 +579,8 @@ void AudioRelay::Worker() {
         const WAVEFORMATEX* fixedFormat = attempt == 2 ? &pcm : nullptr;
 
         failedStep = L"render device setup";
-        startupHr = CreateDefaultRenderClient(renderClient, renderService, &format, renderBufferFrames, renderEvent, fixedFormat);
+        startupHr = CreateDefaultRenderClient(
+            renderClient, renderService, &format, renderBufferFrames, renderEvent, fixedFormat, outputDeviceId_);
         if (SUCCEEDED(startupHr)) {
             startupHr = CreateLoopbackCaptureClient(
                 targetProcessId_, format, captureEvent, captureClient, captureService, bufferDuration, failedStep);

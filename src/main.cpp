@@ -84,6 +84,19 @@ constexpr UINT kCmdAudioSourceStatus = 211;
 constexpr UINT kCmdCopyLog = 212;
 constexpr UINT kCmdMirrorNative = 213;
 constexpr UINT kCmdMirrorFollowsApp = 214;
+constexpr UINT kCmdOutputDeviceBase = 400;  // 400 = Windows default, 401.. = listed devices
+constexpr UINT kCmdOutputDeviceLast = 439;
+constexpr UINT kCmdMirrorSizeBase = 450;
+constexpr UINT kCmdBrightnessBase = 470;
+
+// Mirror size choices: 0 = native, otherwise maximum height (width follows the source's aspect ratio).
+constexpr int kMirrorHeights[] = {0, 1440, 1080, 720};
+constexpr const wchar_t* kMirrorHeightLabels[] = {L"Native (same as game)", L"1440p", L"1080p", L"720p"};
+constexpr float kBrightnessLevels[] = {1.25f, 1.0f, 0.85f, 0.7f, 0.55f};
+constexpr const wchar_t* kBrightnessLabels[] = {L"Brighter", L"Normal", L"Slightly darker", L"Darker", L"Much darker"};
+constexpr DWORD kDefaultBrightnessLevel = 1;
+// Discord streams at most 60 fps, so the mirror does not need more.
+constexpr double kMirrorMaxFps = 60.0;
 
 constexpr UINT_PTR kAudioWatchTimerId = 1;
 constexpr UINT kAudioWatchIntervalMs = 2000;
@@ -98,6 +111,9 @@ constexpr wchar_t kSettingAudioApp[] = L"AudioRelayApp";
 constexpr wchar_t kSettingAudioAppName[] = L"AudioRelayAppName";
 constexpr wchar_t kSettingMirrorNative[] = L"MirrorNativeResolution";
 constexpr wchar_t kSettingMirrorFollowsApp[] = L"MirrorShowsGameWindow";
+constexpr wchar_t kSettingRelayOutputDevice[] = L"RelayOutputDevice";
+constexpr wchar_t kSettingMirrorSize[] = L"MirrorSize";
+constexpr wchar_t kSettingBrightness[] = L"MirrorBrightness";
 
 enum class AudioSourceMode : DWORD {
     Desktop = 0,
@@ -163,8 +179,14 @@ SamplerState sourceSampler : register(s0);
 
 cbuffer ToneMapConstants : register(b0) {
     float sdrWhiteScale;
-    float3 padding;
+    float exposure;
+    float2 padding;
 };
+
+// Highlights above the knee roll off smoothly instead of clipping. Source values up to
+// kHighlightPeak x SDR white land just below SDR white.
+static const float kHighlightKnee = 0.7;
+static const float kHighlightPeak = 8.0;
 
 static const float kSrgbLinearThreshold = 0.0031308;
 static const float kSrgbLinearScale = 12.92;
@@ -213,14 +235,25 @@ float4 PSMain(VSOut input) : SV_TARGET {
     // scaled above 1.0 according to the user's SDR brightness setting, so normalize
     // by that multiplier before encoding an SDR mirror target.
     float whiteScale = max(sdrWhiteScale, 1.0);
-    float3 mapped = saturate(hdr / whiteScale);
-    return float4(LinearToSrgb(mapped), 1.0);
+    float3 color = hdr / whiteScale * exposure;
+
+    // Compress on the brightest channel so hue is kept instead of turning highlights white or yellow.
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak > kHighlightKnee) {
+        float range = 1.0 - kHighlightKnee;
+        float t = (peak - kHighlightKnee) / range;
+        float w = (kHighlightPeak - kHighlightKnee) / range;
+        float compressed = kHighlightKnee + range * (t * (1.0 + t / (w * w)) / (1.0 + t));
+        color *= min(compressed, 1.0) / peak;
+    }
+    return float4(LinearToSrgb(saturate(color)), 1.0);
 }
 )";
 
 struct ToneMapConstants {
     float sdrWhiteScale = 1.0f;
-    float padding[3] = {};
+    float exposure = 1.0f;
+    float padding[2] = {};
 };
 
 template <size_t Size>
@@ -1153,6 +1186,7 @@ private:
             kCmdAudioRelay,
             L"Relay audio with mirror");
         AppendAudioSourceMenu(menu);
+        AppendAudioOutputMenu(menu);
         AppendMenuW(menu, MF_STRING, kCmdSelectMonitor, L"Use monitor under cursor");
         AppendMenuW(
             menu,
@@ -1163,7 +1197,10 @@ private:
             menu,
             MF_STRING | (nativeMirror_ ? MF_CHECKED : MF_UNCHECKED),
             kCmdMirrorNative,
-            L"Mirror at native resolution (no borders)");
+            L"Borderless mirror (no title bar)");
+        AppendChoiceMenu(menu, L"Mirror size", kCmdMirrorSizeBase, kMirrorHeightLabels, std::size(kMirrorHeightLabels), mirrorSizeIndex_);
+        AppendChoiceMenu(
+            menu, L"Mirror brightness", kCmdBrightnessBase, kBrightnessLabels, std::size(kBrightnessLabels), brightnessIndex_);
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), kCmdStartup, L"Run at startup");
         AppendMenuW(menu, MF_STRING, kCmdOpenFolder, L"Open screenshots folder");
@@ -1177,6 +1214,24 @@ private:
     }
 
     void HandleCommand(UINT command) {
+        if (command >= kCmdOutputDeviceBase && command <= kCmdOutputDeviceLast) {
+            SelectOutputDevice(command - kCmdOutputDeviceBase);
+            return;
+        }
+        if (command >= kCmdMirrorSizeBase && command < kCmdMirrorSizeBase + std::size(kMirrorHeights)) {
+            mirrorSizeIndex_ = command - kCmdMirrorSizeBase;
+            WriteSettingDword(kSettingMirrorSize, mirrorSizeIndex_);
+            if (mirrorVisible_ && nativeMirror_) {
+                ApplyMirrorWindowMode(captureSize_.Width, captureSize_.Height);
+            }
+            return;
+        }
+        if (command >= kCmdBrightnessBase && command < kCmdBrightnessBase + std::size(kBrightnessLevels)) {
+            brightnessIndex_ = command - kCmdBrightnessBase;
+            WriteSettingDword(kSettingBrightness, brightnessIndex_);
+            RenderMirror();
+            return;
+        }
         switch (command) {
         case kCmdScreenshot:
             CaptureScreenshot();
@@ -1434,6 +1489,21 @@ private:
                 return;
             }
 
+            // Cap mirror updates at 60 fps; dropped frames go straight back to the pool.
+            LARGE_INTEGER now = {};
+            QueryPerformanceCounter(&now);
+            if (qpcFrequency_ == 0) {
+                LARGE_INTEGER frequency = {};
+                QueryPerformanceFrequency(&frequency);
+                qpcFrequency_ = frequency.QuadPart;
+            }
+            const LONGLONG interval = static_cast<LONGLONG>(static_cast<double>(qpcFrequency_) / kMirrorMaxFps);
+            const LONGLONG tolerance = interval / 8;
+            if (mirrorVisible_ && latestWidth_ != 0 && now.QuadPart + tolerance < nextFrameDue_) {
+                return;
+            }
+            nextFrameDue_ = std::max(nextFrameDue_ + interval, now.QuadPart);
+
             const auto contentSize = frame.ContentSize();
             if (contentSize.Width != captureSize_.Width || contentSize.Height != captureSize_.Height) {
                 captureSize_ = contentSize;
@@ -1588,6 +1658,11 @@ private:
         selectedAppExe_ = ReadSettingString(kSettingAudioApp);
         selectedAppName_ = ReadSettingString(kSettingAudioAppName);
         nativeMirror_ = ReadSettingDword(kSettingMirrorNative, 1) != 0;
+        relayOutputDeviceId_ = ReadSettingString(kSettingRelayOutputDevice);
+        audioRelay_.SetOutputDevice(relayOutputDeviceId_);
+        mirrorSizeIndex_ = std::min<DWORD>(ReadSettingDword(kSettingMirrorSize, 0), static_cast<DWORD>(std::size(kMirrorHeights) - 1));
+        brightnessIndex_ = std::min<DWORD>(
+            ReadSettingDword(kSettingBrightness, kDefaultBrightnessLevel), static_cast<DWORD>(std::size(kBrightnessLevels) - 1));
         mirrorFollowsApp_ = ReadSettingDword(kSettingMirrorFollowsApp, 1) != 0;
         Log(L"Audio relay source: " + AudioSourceLabel());
         Log(L"Windows build " + std::to_wstring(WindowsBuildNumber()) +
@@ -2092,6 +2167,70 @@ private:
         SetAudioSource(AudioSourceMode::SelectedApplication);
     }
 
+    // ---- Tray submenus ----------------------------------------------------------------------
+
+    void AppendChoiceMenu(HMENU menu, const wchar_t* title, UINT firstCommand, const wchar_t* const* labels, size_t count, DWORD selected) {
+        HMENU submenu = CreatePopupMenu();
+        if (!submenu) {
+            return;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            AppendMenuW(submenu, MF_STRING, firstCommand + static_cast<UINT>(i), labels[i]);
+        }
+        CheckMenuRadioItem(
+            submenu, firstCommand, firstCommand + static_cast<UINT>(count) - 1, firstCommand + selected, MF_BYCOMMAND);
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), title);
+    }
+
+    void AppendAudioOutputMenu(HMENU menu) {
+        HMENU submenu = CreatePopupMenu();
+        if (!submenu) {
+            return;
+        }
+        outputDevicesMenu_ = ListAudioOutputDevices();
+        UINT checked = kCmdOutputDeviceBase;
+        AppendMenuW(submenu, MF_STRING, kCmdOutputDeviceBase, L"Windows default (you hear the game twice)");
+        for (size_t i = 0; i < outputDevicesMenu_.size() && kCmdOutputDeviceBase + 1 + i <= kCmdOutputDeviceLast; ++i) {
+            const auto& device = outputDevicesMenu_[i];
+            const std::wstring label = device.name + (device.isDefault ? L"  (your current speakers)" : L"");
+            const UINT command = kCmdOutputDeviceBase + 1 + static_cast<UINT>(i);
+            AppendMenuW(submenu, MF_STRING, command, label.c_str());
+            if (!relayOutputDeviceId_.empty() && device.id == relayOutputDeviceId_) {
+                checked = command;
+            }
+        }
+        CheckMenuRadioItem(
+            submenu,
+            kCmdOutputDeviceBase,
+            kCmdOutputDeviceBase + static_cast<UINT>(outputDevicesMenu_.size()),
+            checked,
+            MF_BYCOMMAND);
+        AppendMenuW(submenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(submenu, MF_STRING | MF_GRAYED, 0, L"Pick an output you don't listen to, to avoid double sound");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(submenu), L"Relay audio plays on");
+    }
+
+    void SelectOutputDevice(UINT index) {
+        if (index == 0) {
+            relayOutputDeviceId_.clear();
+        } else if (index - 1 < outputDevicesMenu_.size()) {
+            relayOutputDeviceId_ = outputDevicesMenu_[index - 1].id;
+        } else {
+            return;
+        }
+        WriteSettingString(kSettingRelayOutputDevice, relayOutputDeviceId_);
+        audioRelay_.SetOutputDevice(relayOutputDeviceId_);
+        const std::wstring name = index == 0 ? std::wstring(L"Windows default") : outputDevicesMenu_[index - 1].name;
+        Log(L"Relay output device: " + name);
+
+        // Restart a running relay so it moves to the new device.
+        if (audioRelay_.IsRunning() || waitingForRelayTarget_) {
+            StopAudioRelay();
+            StartAudioRelayForMirror();
+        }
+        ShowNotification(kAppName, L"Relay audio now plays on " + name + L".");
+    }
+
     // ---- Mirror source and window --------------------------------------------------------------
 
     // The game window to mirror, or nullptr to mirror the whole monitor.
@@ -2142,6 +2281,11 @@ private:
             return;
         }
         if (width > 0 && height > 0) {
+            const int maxHeight = kMirrorHeights[mirrorSizeIndex_];
+            if (maxHeight > 0 && height > maxHeight) {
+                width = static_cast<int>(std::lround(static_cast<double>(width) * maxHeight / height / 2.0)) * 2;
+                height = maxHeight;
+            }
             HMONITOR monitor = capturedWindow_ ? MonitorFromWindow(capturedWindow_, MONITOR_DEFAULTTONEAREST) : selectedMonitor_;
             MONITORINFO info = {};
             info.cbSize = sizeof(info);
@@ -2156,7 +2300,7 @@ private:
                 width,
                 height,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-            Log(L"Mirror window set to native " + std::to_wstring(width) + L"x" + std::to_wstring(height));
+            Log(L"Mirror window size " + std::to_wstring(width) + L"x" + std::to_wstring(height));
         } else {
             RECT workArea = {};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
@@ -2437,6 +2581,7 @@ private:
 
         ToneMapConstants constants = {};
         constants.sdrWhiteScale = sdrWhiteScale_;
+        constants.exposure = kBrightnessLevels[brightnessIndex_];
         d3dContext_->UpdateSubresource(toneMapConstants_.get(), 0, nullptr, &constants, 0, 0);
 
         ID3D11ShaderResourceView* srv = sourceView.get();
@@ -2752,6 +2897,12 @@ private:
     HWND pickerHwnd_ = nullptr;
     HWND pickerList_ = nullptr;
     bool nativeMirror_ = true;
+    std::wstring relayOutputDeviceId_;
+    std::vector<AudioOutputDevice> outputDevicesMenu_;
+    DWORD mirrorSizeIndex_ = 0;
+    DWORD brightnessIndex_ = kDefaultBrightnessLevel;
+    LONGLONG qpcFrequency_ = 0;
+    LONGLONG nextFrameDue_ = 0;
     bool mirrorFollowsApp_ = true;
     HWND capturedWindow_ = nullptr;
     HFONT pickerFont_ = nullptr;

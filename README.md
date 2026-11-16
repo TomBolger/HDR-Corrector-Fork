@@ -59,6 +59,10 @@ Only the chosen program and its child processes are captured. Discord is never a
 
 The mirror window cannot be minimized: minimizing sends it behind other windows instead, because Discord pauses a minimized window ("Switch to application to resume"). Close it with `Ctrl+Alt+H` when you are done.
 
+To stop hearing the game twice, open **Relay audio plays on** in the tray menu and pick an output you don't listen to (for example a monitor's HDMI audio). Discord still picks it up from HDR Corrector.
+
+The mirror updates at up to 60 fps (Discord's maximum). **Mirror size** lowers the mirror's resolution if streaming costs too much performance, and **Mirror brightness** darkens or brightens the picture. Very bright HDR highlights are compressed smoothly instead of clipping to white.
+
 If you hear local echo or doubled audio, right-click the tray icon and uncheck **Relay audio with mirror**. You can also lower or mute **HDR Corrector Stream Audio** in the Windows volume mixer if Discord still receives the stream audio on your setup.
 
 The portable build uses the normal Windows capture border while the mirror is active. The MSIX build requests Windows borderless-capture consent on first capture; if Windows grants it, the mirror can run without the colored capture border. If consent is denied, capture still works with the border.
