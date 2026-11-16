@@ -329,3 +329,50 @@ DWORD WindowsBuildNumber() {
     info.dwOSVersionInfoSize = sizeof(info);
     return rtlGetVersion(&info) == 0 ? info.dwBuildNumber : 0;
 }
+
+HWND MainWindowForProcess(DWORD processId) {
+    struct Search {
+        DWORD processId;
+        HWND best;
+        LONG bestArea;
+    } search = {processId, nullptr, -1};
+
+    EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+            auto* state = reinterpret_cast<Search*>(param);
+            DWORD owner = 0;
+            GetWindowThreadProcessId(hwnd, &owner);
+            if (owner != state->processId || !IsAppWindow(hwnd)) {
+                return TRUE;
+            }
+            RECT rect = {};
+            GetWindowRect(hwnd, &rect);
+            const LONG area = (rect.right - rect.left) * (rect.bottom - rect.top);
+            if (area > state->bestArea) {
+                state->best = hwnd;
+                state->bestArea = area;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&search));
+    return search.best;
+}
+
+int ProcessElevation(DWORD processId) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) {
+        return -1;
+    }
+    HANDLE token = nullptr;
+    int result = -1;
+    if (OpenProcessToken(process, TOKEN_QUERY, &token)) {
+        TOKEN_ELEVATION elevation = {};
+        DWORD size = 0;
+        if (GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size)) {
+            result = elevation.TokenIsElevated ? 1 : 0;
+        }
+        CloseHandle(token);
+    }
+    CloseHandle(process);
+    return result;
+}

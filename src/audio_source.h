@@ -35,5 +35,11 @@ std::wstring AudioTargetProblem(DWORD processId);
 
 std::wstring AudioAppDisplayName(const AudioAppInfo& info);
 
+// Largest visible top-level window owned by the process, or nullptr.
+HWND MainWindowForProcess(DWORD processId);
+
+// 1 = elevated (Run as administrator), 0 = not elevated, -1 = could not tell (often means elevated/protected).
+int ProcessElevation(DWORD processId);
+
 // Windows build number (e.g. 22631). Per-app audio capture needs build 20348 or newer.
 DWORD WindowsBuildNumber();

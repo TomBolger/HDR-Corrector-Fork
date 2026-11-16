@@ -6,6 +6,8 @@
 #include "platform.h"
 
 #include <audioclient.h>
+#include <mmreg.h>
+#include <ksmedia.h>
 #include <audioclientactivationparams.h>
 #include <audiopolicy.h>
 #include <mmdeviceapi.h>
@@ -13,6 +15,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <new>
 
@@ -252,6 +255,39 @@ HRESULT CreateLoopbackCaptureClient(
         failedStep = L"";
     }
     return hr;
+}
+
+bool IsFloatFormat(const WAVEFORMATEX* format) {
+    if (format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        return true;
+    }
+    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE && format->cbSize >= 22) {
+        const auto* extensible = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(format);
+        return extensible->SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    }
+    return false;
+}
+
+// Peak level 0..1 of a packet, for diagnostics only.
+float PacketPeak(const WAVEFORMATEX* format, const BYTE* data, UINT32 frames) {
+    if (!data || frames == 0) {
+        return 0.0f;
+    }
+    const size_t samples = static_cast<size_t>(frames) * format->nChannels;
+    float peak = 0.0f;
+    if (IsFloatFormat(format) && format->wBitsPerSample == 32) {
+        const auto* values = reinterpret_cast<const float*>(data);
+        for (size_t i = 0; i < samples; ++i) {
+            peak = std::max(peak, values[i] < 0 ? -values[i] : values[i]);
+        }
+    } else if (format->wBitsPerSample == 16) {
+        const auto* values = reinterpret_cast<const int16_t*>(data);
+        for (size_t i = 0; i < samples; ++i) {
+            const int value = values[i] < 0 ? -static_cast<int>(values[i]) : values[i];
+            peak = std::max(peak, static_cast<float>(value) / 32768.0f);
+        }
+    }
+    return peak;
 }
 
 bool WaitForStopOrEvent(HANDLE stopEvent, HANDLE eventHandle, DWORD timeoutMilliseconds) {
@@ -514,8 +550,43 @@ void AudioRelay::Worker() {
 
         HANDLE waitHandles[] = {stopEvent_, captureEvent};
         bool stopRequested = false;
+
+        // Diagnostics: report whether real sound is arriving (first after 10 s, then every minute).
+        ULONGLONG statsStart = GetTickCount64();
+        ULONGLONG nextReport = statsStart + 10000;
+        UINT64 packetCount = 0;
+        UINT64 silentPackets = 0;
+        float peakLevel = 0.0f;
+        auto reportLevels = [&](bool final) {
+            const ULONGLONG now = GetTickCount64();
+            wchar_t line[256] = {};
+            swprintf_s(
+                line,
+                L"Audio relay levels over %llu s: %llu packets, %llu silent, peak %.3f%s",
+                (now - statsStart) / 1000,
+                packetCount,
+                silentPackets,
+                peakLevel,
+                packetCount == 0 ? L" (no audio received from the source)"
+                    : (peakLevel < 0.0005f ? L" (source is silent)" : L""));
+            Log(line);
+            if (!final) {
+                statsStart = now;
+                nextReport = now + 60000;
+                packetCount = 0;
+                silentPackets = 0;
+                peakLevel = 0.0f;
+            }
+        };
+
         while (!stopRequested) {
-            const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+            if (GetTickCount64() >= nextReport) {
+                reportLevels(false);
+            }
+            const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, 1000);
+            if (waitResult == WAIT_TIMEOUT) {
+                continue;
+            }
             if (waitResult == WAIT_OBJECT_0) {
                 stopRequested = true;
                 break;
@@ -537,6 +608,13 @@ void AudioRelay::Worker() {
                 hr = captureService->GetBuffer(&data, &framesAvailable, &flags, &devicePosition, &qpcPosition);
                 if (FAILED(hr)) {
                     break;
+                }
+
+                ++packetCount;
+                if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0) {
+                    ++silentPackets;
+                } else {
+                    peakLevel = std::max(peakLevel, PacketPeak(format, data, framesAvailable));
                 }
 
                 const HRESULT relayHr = RelayFrames(
@@ -569,6 +647,7 @@ void AudioRelay::Worker() {
                 break;
             }
         }
+        reportLevels(true);
     }
 
     if (captureClient) {

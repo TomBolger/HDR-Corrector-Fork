@@ -63,6 +63,7 @@ constexpr wchar_t kRunValueName[] = L"HDRCorrector";
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kRenderMirrorMessage = WM_APP + 2;
 constexpr UINT kRestoreMirrorMessage = WM_APP + 3;
+constexpr UINT kMirrorSourceSizeMessage = WM_APP + 4;
 constexpr UINT_PTR kTrayIconId = 1;
 constexpr int kHotkeyScreenshot = 100;
 constexpr int kHotkeyMirror = 101;
@@ -81,6 +82,8 @@ constexpr UINT kCmdAudioSourceActive = 209;
 constexpr UINT kCmdAudioSourceSelect = 210;
 constexpr UINT kCmdAudioSourceStatus = 211;
 constexpr UINT kCmdCopyLog = 212;
+constexpr UINT kCmdMirrorNative = 213;
+constexpr UINT kCmdMirrorFollowsApp = 214;
 
 constexpr UINT_PTR kAudioWatchTimerId = 1;
 constexpr UINT kAudioWatchIntervalMs = 2000;
@@ -93,6 +96,8 @@ constexpr wchar_t kSettingsKey[] = L"Software\\HDRCorrector";
 constexpr wchar_t kSettingAudioSource[] = L"AudioRelaySource";
 constexpr wchar_t kSettingAudioApp[] = L"AudioRelayApp";
 constexpr wchar_t kSettingAudioAppName[] = L"AudioRelayAppName";
+constexpr wchar_t kSettingMirrorNative[] = L"MirrorNativeResolution";
+constexpr wchar_t kSettingMirrorFollowsApp[] = L"MirrorShowsGameWindow";
 
 enum class AudioSourceMode : DWORD {
     Desktop = 0,
@@ -792,6 +797,11 @@ private:
                 return 0;
             }
             return DefWindowProcW(hwnd, message, wparam, lparam);
+        case kMirrorSourceSizeMessage:
+            if (mirrorVisible_ && nativeMirror_) {
+                ApplyMirrorWindowMode(static_cast<int>(wparam), static_cast<int>(lparam));
+            }
+            return 0;
         case kRestoreMirrorMessage:
             if (mirrorVisible_ && IsIconic(hwnd)) {
                 ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -1144,6 +1154,16 @@ private:
             L"Relay audio with mirror");
         AppendAudioSourceMenu(menu);
         AppendMenuW(menu, MF_STRING, kCmdSelectMonitor, L"Use monitor under cursor");
+        AppendMenuW(
+            menu,
+            MF_STRING | (mirrorFollowsApp_ ? MF_CHECKED : MF_UNCHECKED),
+            kCmdMirrorFollowsApp,
+            L"Mirror shows only the game window");
+        AppendMenuW(
+            menu,
+            MF_STRING | (nativeMirror_ ? MF_CHECKED : MF_UNCHECKED),
+            kCmdMirrorNative,
+            L"Mirror at native resolution (no borders)");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED), kCmdStartup, L"Run at startup");
         AppendMenuW(menu, MF_STRING, kCmdOpenFolder, L"Open screenshots folder");
@@ -1190,6 +1210,20 @@ private:
             break;
         case kCmdCopyLog:
             CopyLogToClipboard();
+            break;
+        case kCmdMirrorNative:
+            nativeMirror_ = !nativeMirror_;
+            WriteSettingDword(kSettingMirrorNative, nativeMirror_ ? 1 : 0);
+            if (mirrorVisible_) {
+                ApplyMirrorWindowMode(nativeMirror_ ? captureSize_.Width : 0, nativeMirror_ ? captureSize_.Height : 0);
+            }
+            break;
+        case kCmdMirrorFollowsApp:
+            mirrorFollowsApp_ = !mirrorFollowsApp_;
+            WriteSettingDword(kSettingMirrorFollowsApp, mirrorFollowsApp_ ? 1 : 0);
+            if (mirrorVisible_ && StartMirrorCapture()) {
+                RenderMirror();
+            }
             break;
         case kCmdExit:
             DestroyWindow(hiddenHwnd_);
@@ -1334,9 +1368,7 @@ private:
     }
 
     bool CanUseBorderlessCapture() {
-        if (!HasPackageIdentity()) {
-            return false;
-        }
+        // Windows 11 also grants borderless capture to portable (unpackaged) apps, usually without a prompt.
 
         if (!borderlessCaptureAccessChecked_) {
             borderlessCaptureAccessChecked_ = true;
@@ -1406,6 +1438,13 @@ private:
             if (contentSize.Width != captureSize_.Width || contentSize.Height != captureSize_.Height) {
                 captureSize_ = contentSize;
                 framePool_.Recreate(direct3DDevice_, kFramePoolFormat, kFramePoolBufferCount, captureSize_);
+                if (mirrorHwnd_) {
+                    PostMessageW(
+                        mirrorHwnd_,
+                        kMirrorSourceSizeMessage,
+                        static_cast<WPARAM>(contentSize.Width),
+                        static_cast<LPARAM>(contentSize.Height));
+                }
             }
 
             auto access = frame.Surface().as<DxgiInterfaceAccess>();
@@ -1469,19 +1508,27 @@ private:
         }
 
         const bool showMirror = !mirrorVisible_;
-        if (showMirror && !StartCapture(selectedMonitor_)) {
+        if (showMirror && !StartMirrorCapture()) {
             return;
         }
 
         mirrorVisible_ = showMirror;
-        ShowWindow(mirrorHwnd_, mirrorVisible_ ? SW_SHOWNORMAL : SW_HIDE);
         if (mirrorVisible_) {
-            SetForegroundWindow(mirrorHwnd_);
+            if (nativeMirror_) {
+                // Sized exactly to the source and kept behind the game, so it never steals focus.
+                ApplyMirrorWindowMode(captureSize_.Width, captureSize_.Height);
+            } else {
+                ApplyMirrorWindowMode(0, 0);
+                ShowWindow(mirrorHwnd_, SW_SHOWNORMAL);
+                SetForegroundWindow(mirrorHwnd_);
+            }
             RenderMirror();
             StartAudioRelayForMirror();
         } else {
+            ShowWindow(mirrorHwnd_, SW_HIDE);
             StopAudioRelay();
             StopCapture();
+            capturedWindow_ = nullptr;
         }
         UpdateTrayTooltip();
     }
@@ -1540,6 +1587,8 @@ private:
             : AudioSourceMode::Desktop;
         selectedAppExe_ = ReadSettingString(kSettingAudioApp);
         selectedAppName_ = ReadSettingString(kSettingAudioAppName);
+        nativeMirror_ = ReadSettingDword(kSettingMirrorNative, 1) != 0;
+        mirrorFollowsApp_ = ReadSettingDword(kSettingMirrorFollowsApp, 1) != 0;
         Log(L"Audio relay source: " + AudioSourceLabel());
         Log(L"Windows build " + std::to_wstring(WindowsBuildNumber()) +
             (HasPackageIdentity() ? L", running as installed package (setup.exe)" : L", running as portable exe (zip)"));
@@ -1687,7 +1736,9 @@ private:
     bool StartAppRelay(const AudioAppInfo& target) {
         const auto name = TargetName(target);
         const auto label = TargetLogLabel(target);
-        Log(L"Audio relay target: " + label);
+        const int elevation = ProcessElevation(target.processId);
+        Log(L"Audio relay target: " + label + (elevation == 1 ? L" [runs as administrator]"
+            : elevation == 0 ? L" [normal]" : L" [elevation unknown]"));
 
         const auto problem = AudioTargetProblem(target.processId);
         if (!problem.empty()) {
@@ -1785,7 +1836,11 @@ private:
             return;
         }
 
-        if (!audioRelay_.IsRunning()) {
+        if (audioRelay_.IsRunning()) {
+            FollowRestartedGameWindow();
+            return;
+        }
+        {
             Log(L"Audio relay stopped unexpectedly; restarting capture of " + TargetLogLabel(relayTarget_));
             const AudioAppInfo target = relayTarget_;
             StartAppRelay(target);
@@ -2037,6 +2092,102 @@ private:
         SetAudioSource(AudioSourceMode::SelectedApplication);
     }
 
+    // ---- Mirror source and window --------------------------------------------------------------
+
+    // The game window to mirror, or nullptr to mirror the whole monitor.
+    HWND MirrorSourceWindow() const {
+        if (!mirrorFollowsApp_) {
+            return nullptr;
+        }
+        HWND window = nullptr;
+        if (audioSourceMode_ == AudioSourceMode::ActiveApplication) {
+            window = lastForegroundHwnd_;
+        } else if (audioSourceMode_ == AudioSourceMode::SelectedApplication) {
+            const DWORD processId = pickedProcessId_ != 0 ? pickedProcessId_ : FindProcessByExeName(selectedAppExe_);
+            window = processId != 0 ? MainWindowForProcess(processId) : nullptr;
+        }
+        if (!window || !IsWindow(window) || !IsWindowVisible(window) || IsIconic(window)) {
+            return nullptr;
+        }
+        return window;
+    }
+
+    bool StartMirrorCapture() {
+        HWND window = MirrorSourceWindow();
+        if (window) {
+            if (StartWindowCapture(window, true)) {
+                capturedWindow_ = window;
+                Log(L"Mirror capturing game window \"" + WindowTitle(window) + L"\" at " +
+                    std::to_wstring(captureSize_.Width) + L"x" + std::to_wstring(captureSize_.Height));
+                return true;
+            }
+            Log(L"Game window capture failed; mirroring the whole monitor instead.");
+        }
+        capturedWindow_ = nullptr;
+        return StartCapture(selectedMonitor_);
+    }
+
+    bool RestartMirrorCapture() {
+        if (capturedWindow_ && IsWindow(capturedWindow_) && StartWindowCapture(capturedWindow_, false)) {
+            return true;
+        }
+        capturedWindow_ = nullptr;
+        return StartCapture(selectedMonitor_, false);
+    }
+
+    // width/height > 0: borderless window exactly the source size, placed behind everything on the
+    // source's monitor. 0: the original resizable window.
+    void ApplyMirrorWindowMode(int width, int height) {
+        if (!mirrorHwnd_) {
+            return;
+        }
+        if (width > 0 && height > 0) {
+            HMONITOR monitor = capturedWindow_ ? MonitorFromWindow(capturedWindow_, MONITOR_DEFAULTTONEAREST) : selectedMonitor_;
+            MONITORINFO info = {};
+            info.cbSize = sizeof(info);
+            GetMonitorInfoW(monitor, &info);
+            SetWindowLongPtrW(mirrorHwnd_, GWL_STYLE, WS_POPUP | (IsWindowVisible(mirrorHwnd_) ? WS_VISIBLE : 0));
+            SetWindowLongPtrW(mirrorHwnd_, GWL_EXSTYLE, WS_EX_APPWINDOW);
+            SetWindowPos(
+                mirrorHwnd_,
+                HWND_BOTTOM,
+                info.rcMonitor.left,
+                info.rcMonitor.top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            Log(L"Mirror window set to native " + std::to_wstring(width) + L"x" + std::to_wstring(height));
+        } else {
+            RECT workArea = {};
+            SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+            SetWindowLongPtrW(mirrorHwnd_, GWL_STYLE, WS_OVERLAPPEDWINDOW | (IsWindowVisible(mirrorHwnd_) ? WS_VISIBLE : 0));
+            SetWindowLongPtrW(mirrorHwnd_, GWL_EXSTYLE, 0);
+            SetWindowPos(
+                mirrorHwnd_,
+                nullptr,
+                workArea.left + kMirrorInitialOffset,
+                workArea.top + kMirrorInitialOffset,
+                kMirrorInitialWidth,
+                kMirrorInitialHeight,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+
+    // Game restarted: its old window is gone, so follow the new one.
+    void FollowRestartedGameWindow() {
+        if (!mirrorVisible_ || !mirrorFollowsApp_ || relayTarget_.processId == 0) {
+            return;
+        }
+        if (capturedWindow_ && IsWindow(capturedWindow_)) {
+            return;
+        }
+        HWND window = MainWindowForProcess(relayTarget_.processId);
+        if (window && !IsIconic(window) && StartWindowCapture(window, false)) {
+            capturedWindow_ = window;
+            Log(L"Mirror now capturing restarted game window \"" + WindowTitle(window) + L"\"");
+        }
+    }
+
     // ---- Troubleshooting ---------------------------------------------------------------------
 
     // The installed (MSIX) build keeps its log in a hidden package folder, so copy it for the user.
@@ -2118,6 +2269,7 @@ private:
         sdrWhiteScale_ = SdrWhiteScaleForMonitor(selectedMonitor_);
 
         if (mirrorVisible_) {
+            capturedWindow_ = nullptr;
             StartCapture(selectedMonitor_);
         }
 
@@ -2424,7 +2576,7 @@ private:
 
     void FinishTemporaryScreenshotCapture(bool restoreMirrorCapture) {
         if (restoreMirrorCapture) {
-            if (StartCapture(selectedMonitor_, false)) {
+            if (RestartMirrorCapture()) {
                 RenderMirror();
             } else {
                 Log(L"Could not restore stream mirror capture after active window screenshot.");
@@ -2500,7 +2652,7 @@ private:
 
         if (!StartWindowCapture(hwnd, false)) {
             if (restoreMirrorCapture) {
-                StartCapture(selectedMonitor_, false);
+                RestartMirrorCapture();
             }
             return;
         }
@@ -2599,6 +2751,9 @@ private:
     std::wstring audioStatus_;
     HWND pickerHwnd_ = nullptr;
     HWND pickerList_ = nullptr;
+    bool nativeMirror_ = true;
+    bool mirrorFollowsApp_ = true;
+    HWND capturedWindow_ = nullptr;
     HFONT pickerFont_ = nullptr;
     std::vector<AudioAppInfo> pickerApps_;
 
